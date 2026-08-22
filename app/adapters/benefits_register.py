@@ -48,3 +48,24 @@ class BenefitsRegisterClient:
             if attempt < self.max_retries - 1:
                 time.sleep(self.retry_base_delay * (2 ** attempt) + random.uniform(0, 0.1))
         raise last_error or SourceUnavailable('benefits register failed with no detail')
+
+    @staticmethod
+    def _parse_records(xml_text):
+        root = ET.fromstring(xml_text)
+        records = []
+        for rec in root.findall('Record'):
+            records.append({
+                'ref': rec.findtext('Ref', ''),
+                'name': rec.findtext('Name', ''),
+                'born': rec.findtext('Born', ''),
+                'addr': rec.findtext('Addr', ''),
+                'town': rec.findtext('Town', ''),
+                'benefit_code': rec.findtext('BenefitCode', ''),
+                'review_due': rec.findtext('ReviewDue', ''),
+            })
+        return records
+
+    def get_by_ref(self, ref):
+        text = self._get_with_retry(f'/records/{ref}')
+        records = self._parse_records(text)
+        return records[0]
