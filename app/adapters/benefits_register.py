@@ -29,7 +29,8 @@ class BenefitsRegisterClient:
             with urllib.request.urlopen(url, timeout=self.timeout) as resp:
                 return resp.getcode(), resp.read().decode('utf-8')
         except urllib.error.HTTPError as e:
-            return e.code, e.read().decode('utf-8')
+            with e:
+                return e.code, e.read().decode('utf-8')
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             raise SourceUnavailable(f'benefits register unreachable: {e}') from e
 
