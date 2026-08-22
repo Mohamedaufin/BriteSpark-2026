@@ -60,3 +60,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *a):
         print(f'  [api] {fmt % a}')
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--port', type=int, default=config.API_PORT)
+    args = ap.parse_args()
+    print(f'Unified Resident View on http://127.0.0.1:{args.port}')
+    print(f'  resident index    -> {config.REST_BASE_URL}')
+    print(f'  benefits register -> {config.XML_BASE_URL}')
+    ThreadingHTTPServer(('127.0.0.1', args.port), Handler).serve_forever()
+
+
+if __name__ == '__main__':
+    main()
