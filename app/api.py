@@ -33,6 +33,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        try:
+            return self._route()
+        except Exception as e:
+            return self._send(500, {'error': 'internal_error', 'detail': str(e)})
+
+    def _route(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         attempt_match = q.get('match', [''])[0] == 'basic'
