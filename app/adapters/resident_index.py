@@ -25,7 +25,8 @@ class ResidentIndexClient:
             with urllib.request.urlopen(url, timeout=self.timeout) as resp:
                 return resp.getcode(), json.loads(resp.read().decode('utf-8'))
         except urllib.error.HTTPError as e:
-            body = e.read().decode('utf-8')
+            with e:
+                body = e.read().decode('utf-8')
             try:
                 return e.code, json.loads(body)
             except json.JSONDecodeError:
