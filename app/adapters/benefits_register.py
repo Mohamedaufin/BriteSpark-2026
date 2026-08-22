@@ -1,6 +1,7 @@
 import random
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
@@ -66,6 +67,9 @@ class BenefitsRegisterClient:
         return records
 
     def get_by_ref(self, ref):
-        text = self._get_with_retry(f'/records/{ref}')
+        safe_ref = urllib.parse.quote(ref, safe='')
+        text = self._get_with_retry(f'/records/{safe_ref}')
+        if text is None:
+            return None
         records = self._parse_records(text)
-        return records[0]
+        return records[0] if records else None
