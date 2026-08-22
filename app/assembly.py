@@ -47,3 +47,45 @@ def find_benefits_match(resident, benefits_index):
             f'{len(candidates)} benefits records share this name and date of birth; declining to guess'
         )
     return 'matched', candidates[0], None
+
+
+def _status(status, error=None):
+    return {'status': status, 'error': error}
+
+
+NOT_ATTEMPTED_REASON = 'cross-source matching is opt-in (pass ?match=basic)'
+
+
+def build_unified_resident(resident_id, rest_client, benefits_client, attempt_match=False):
+    unified = {'resident_id': resident_id, 'resident': None, 'benefits': None}
+
+    try:
+        resident = rest_client.get_by_id(resident_id)
+    except SourceUnavailable as e:
+        unified['resident_source'] = _status('unavailable', str(e))
+        unified['benefits_source'] = _status('not_attempted', 'resident lookup failed; nothing to match against')
+        return unified
+
+    if resident is None:
+        unified['resident_source'] = _status('not_found')
+        unified['benefits_source'] = _status('not_attempted', 'no such resident')
+        return unified
+
+    unified['resident'] = resident
+    unified['resident_source'] = _status('ok')
+
+    if not attempt_match:
+        unified['benefits_source'] = _status('not_attempted', NOT_ATTEMPTED_REASON)
+        return unified
+
+    try:
+        xml_records = benefits_client.list_all()
+    except SourceUnavailable as e:
+        unified['benefits_source'] = _status('unavailable', str(e))
+        return unified
+
+    index = build_benefits_index(xml_records)
+    status, record, reason = find_benefits_match(resident, index)
+    unified['benefits'] = record
+    unified['benefits_source'] = _status(status, reason)
+    return unified
