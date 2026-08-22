@@ -1,3 +1,9 @@
+"""Client for the Resident Index (REST, paginated).
+
+The index is mostly reliable but its sort key can shift while a client is
+paging, which serves some records on two consecutive pages. list_all()
+collapses that by keying on id rather than trusting page boundaries.
+"""
 import json
 import urllib.error
 import urllib.parse
