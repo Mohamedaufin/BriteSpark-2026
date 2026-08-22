@@ -5,6 +5,8 @@ import urllib.request
 
 from app.errors import SourceUnavailable
 
+PAGE_SIZE = 25
+
 
 class ResidentIndexClient:
     def __init__(self, base_url, timeout=5.0):
@@ -40,3 +42,18 @@ class ResidentIndexClient:
         if code != 200:
             raise SourceUnavailable(f'resident index returned {code}: {body}')
         return body
+
+    def list_all(self):
+        """Walk every page, deduping by id. Returns {id: record}."""
+        by_id = {}
+        page = 1
+        while True:
+            code, body = self._get_json(f'/residents?page={page}&page_size={PAGE_SIZE}')
+            if code != 200:
+                raise SourceUnavailable(f'resident index returned {code}: {body}')
+            for r in body.get('results', []):
+                by_id[r['id']] = r
+            if not body.get('has_more'):
+                break
+            page += 1
+        return by_id
