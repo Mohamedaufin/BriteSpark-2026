@@ -73,3 +73,10 @@ class BenefitsRegisterClient:
             return None
         records = self._parse_records(text)
         return records[0] if records else None
+
+    def list_all(self):
+        """Returns {ref: record}."""
+        text = self._get_with_retry('/records')
+        if text is None:
+            return {}
+        return {r['ref']: r for r in self._parse_records(text)}
