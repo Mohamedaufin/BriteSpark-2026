@@ -52,6 +52,10 @@ class Handler(BaseHTTPRequestHandler):
             result = build_unified_resident(resident_id, rest_client, benefits_client, attempt_match)
             return self._send(200, result)
 
+        if u.path == '/unified/residents':
+            result = build_unified_all(rest_client, benefits_client, attempt_match)
+            return self._send(200, result)
+
         return self._send(404, {'error': 'no_such_endpoint', 'path': u.path})
 
     def log_message(self, fmt, *a):
