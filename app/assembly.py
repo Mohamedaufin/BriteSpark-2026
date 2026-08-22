@@ -89,3 +89,38 @@ def build_unified_resident(resident_id, rest_client, benefits_client, attempt_ma
     unified['benefits'] = record
     unified['benefits_source'] = _status(status, reason)
     return unified
+
+
+def build_unified_all(rest_client, benefits_client, attempt_match=False):
+    try:
+        residents = rest_client.list_all()
+    except SourceUnavailable as e:
+        return {'resident_source': _status('unavailable', str(e)), 'count': 0, 'residents': []}
+
+    benefits_index = None
+    benefits_source = _status('not_attempted', NOT_ATTEMPTED_REASON)
+    if attempt_match:
+        try:
+            xml_records = benefits_client.list_all()
+            benefits_index = build_benefits_index(xml_records)
+            benefits_source = _status('ok')
+        except SourceUnavailable as e:
+            benefits_source = _status('unavailable', str(e))
+
+    results = []
+    for resident_id, resident in residents.items():
+        entry = {'resident_id': resident_id, 'resident': resident, 'benefits': None}
+        if benefits_index is None:
+            entry['benefits_source'] = benefits_source
+        else:
+            status, record, reason = find_benefits_match(resident, benefits_index)
+            entry['benefits'] = record
+            entry['benefits_source'] = _status(status, reason)
+        results.append(entry)
+
+    return {
+        'resident_source': _status('ok'),
+        'benefits_source': benefits_source,
+        'count': len(results),
+        'residents': results,
+    }
