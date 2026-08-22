@@ -1,5 +1,6 @@
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from app.errors import SourceUnavailable
@@ -30,3 +31,12 @@ class ResidentIndexClient:
             return code == 200
         except SourceUnavailable:
             return False
+
+    def get_by_id(self, resident_id):
+        safe_id = urllib.parse.quote(resident_id, safe='')
+        code, body = self._get_json(f'/residents/{safe_id}')
+        if code == 404:
+            return None
+        if code != 200:
+            raise SourceUnavailable(f'resident index returned {code}: {body}')
+        return body
