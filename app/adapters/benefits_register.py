@@ -1,4 +1,5 @@
 import random
+import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
