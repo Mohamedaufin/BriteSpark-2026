@@ -1,3 +1,4 @@
+import random
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -29,3 +30,20 @@ class BenefitsRegisterClient:
             return code == 200
         except SourceUnavailable:
             return False
+
+    def _get_with_retry(self, path):
+        last_error = None
+        for attempt in range(self.max_retries):
+            try:
+                code, text = self._get(path)
+            except SourceUnavailable as e:
+                last_error = e
+            else:
+                if code == 200:
+                    return text
+                if code == 404:
+                    return None
+                last_error = SourceUnavailable(f'benefits register returned {code}: {text}')
+            if attempt < self.max_retries - 1:
+                time.sleep(self.retry_base_delay * (2 ** attempt) + random.uniform(0, 0.1))
+        raise last_error or SourceUnavailable('benefits register failed with no detail')
