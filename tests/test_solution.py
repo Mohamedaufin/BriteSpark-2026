@@ -9,9 +9,13 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import unittest
 import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest.mock import patch
+from urllib.parse import urlparse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -129,6 +133,21 @@ class UnifiedAssemblyTests(unittest.TestCase):
         self.assertEqual(result['benefits_source']['status'], 'not_attempted')
         self.assertIsNone(result['benefits'])
 
+    def test_finds_a_true_cross_source_match(self):
+        # R-10697 / Daniel Delgado is a confirmed real pair in the data pack
+        # (verified against the hidden _pid ground truth - see
+        # scripts/match_accuracy_check.py).
+        result = build_unified_resident('R-10697', self.rest, self.healthy_benefits, attempt_match=True)
+        self.assertEqual(result['benefits_source']['status'], 'matched')
+        self.assertIsNotNone(result['benefits'])
+        self.assertEqual(result['benefits']['ref'], 'NO/2019/4697')
+
+    def test_no_match_when_no_benefits_record_shares_the_key(self):
+        # R-10394 / Paul Quill has no counterpart in the benefits register.
+        result = build_unified_resident('R-10394', self.rest, self.healthy_benefits, attempt_match=True)
+        self.assertEqual(result['benefits_source']['status'], 'no_match')
+        self.assertIsNone(result['benefits'])
+
     def test_degrades_gracefully_when_benefits_source_is_dead(self):
         result = build_unified_resident(self.some_id, self.rest, self.dead_benefits, attempt_match=True)
         self.assertEqual(result['resident_source']['status'], 'ok')
@@ -159,6 +178,97 @@ class UnifiedAssemblyTests(unittest.TestCase):
         status, record, reason = find_benefits_match(resident, index)
         self.assertEqual(status, 'ambiguous')
         self.assertIsNone(record)
+
+
+def _stub_server(response_map):
+    """A throwaway HTTP server returning canned (status, content_type, body)
+    per path, ignoring query strings. Used to simulate malformed upstream
+    responses the real mock services never actually send."""
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            status, ctype, body = response_map.get(
+                urlparse(self.path).path, (404, 'text/plain', 'not found'),
+            )
+            b = body.encode('utf-8')
+            self.send_response(status)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Content-Length', str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        def log_message(self, fmt, *a):
+            pass
+
+    server = HTTPServer(('127.0.0.1', 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+class MalformedUpstreamTests(unittest.TestCase):
+    """The real mock services never send garbage - these simulate the case
+    anyway, since a well-behaved adapter shouldn't only survive the failure
+    modes it was told to expect."""
+
+    def test_malformed_xml_is_a_source_failure_not_a_crash(self):
+        server = _stub_server({
+            '/health': (200, 'application/xml', '<Health><Status>ok</Status></Health>'),
+            '/records': (200, 'application/xml', '<BenefitsRegister><Record><Ref>NO/1</Ref>'),  # truncated
+        })
+        try:
+            port = server.server_address[1]
+            client = BenefitsRegisterClient(f'http://127.0.0.1:{port}', max_retries=1)
+            with self.assertRaises(SourceUnavailable):
+                client.list_all()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_rest_record_missing_id_is_a_source_failure_not_a_crash(self):
+        server = _stub_server({
+            '/health': (200, 'application/json', '{"status": "ok"}'),
+            '/residents': (200, 'application/json', '{"has_more": false, "results": [{"first_name": "No Id"}]}'),
+        })
+        try:
+            port = server.server_address[1]
+            client = ResidentIndexClient(f'http://127.0.0.1:{port}')
+            with self.assertRaises(SourceUnavailable):
+                client.list_all()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_pagination_walk_is_bounded_against_a_source_that_never_stops(self):
+        # A source that pathologically never sets has_more=false would
+        # otherwise page forever - each individual call has a timeout, but
+        # the walk itself didn't, until MAX_PAGES capped it.
+        server = _stub_server({
+            '/health': (200, 'application/json', '{"status": "ok"}'),
+            '/residents': (200, 'application/json', '{"has_more": true, "results": [{"id": "R-1"}]}'),
+        })
+        try:
+            port = server.server_address[1]
+            client = ResidentIndexClient(f'http://127.0.0.1:{port}')
+            import app.adapters.resident_index as resident_index_module
+            with patch.object(resident_index_module, 'MAX_PAGES', 3):
+                with self.assertRaises(SourceUnavailable):
+                    client.list_all()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_non_json_rest_response_is_a_source_failure_not_a_crash(self):
+        server = _stub_server({
+            '/health': (200, 'application/json', '{"status": "ok"}'),
+            '/residents/R-1': (200, 'text/plain', 'this is not json'),
+        })
+        try:
+            port = server.server_address[1]
+            client = ResidentIndexClient(f'http://127.0.0.1:{port}')
+            with self.assertRaises(SourceUnavailable):
+                client.get_by_id('R-1')
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == '__main__':

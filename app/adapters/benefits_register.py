@@ -60,7 +60,10 @@ class BenefitsRegisterClient:
 
     @staticmethod
     def _parse_records(xml_text):
-        root = ET.fromstring(xml_text)
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError as e:
+            raise SourceUnavailable(f'benefits register returned unparseable XML: {e}') from e
         records = []
         for rec in root.findall('Record'):
             records.append({
