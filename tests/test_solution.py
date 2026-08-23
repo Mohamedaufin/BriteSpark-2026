@@ -65,7 +65,11 @@ def setUpModule():
     _procs.append(_spawn(os.path.join(services_dir, 'rest_service.py'), REST_PORT))
     _procs.append(_spawn(
         os.path.join(services_dir, 'xml_service.py'), XML_PORT_NORMAL,
-        {'BENEFITS_FAILURE_RATE': '0.15'},
+        # Day two: the register's failure rate is now permanently 40%, not
+        # the original 15% - see DECISIONS.md. The test double for "normal,
+        # flaky, but working" register has to reflect that or it isn't
+        # actually testing the thing that changed.
+        {'BENEFITS_FAILURE_RATE': '0.40'},
     ))
     _procs.append(_spawn(
         os.path.join(services_dir, 'xml_service.py'), XML_PORT_DEAD,
