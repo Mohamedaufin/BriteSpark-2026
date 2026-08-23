@@ -129,26 +129,46 @@ def find_resident_match(benefit, resident_key_index, benefits_index=None):
     return 'matched', residents[0], None, MATCH_CONFIDENCE
 
 
-def _status(status, error=None, confidence=None):
+STALE_NOTE = (
+    'this source did not answer, so these values come from the last copy we '
+    'successfully fetched - they may have changed since'
+)
+
+
+def _status(status, error=None, confidence=None, stale_seconds=None):
+    """Every source block in every response is built here, so they all have
+    the same shape: what happened, and why in plain language."""
     payload = {'status': status, 'error': error}
     if confidence is not None:
         payload['confidence'] = confidence
         payload['confidence_basis'] = MATCH_BASIS
+    if stale_seconds is not None:
+        # Never show old data without saying it is old.
+        payload['stale_seconds'] = round(stale_seconds, 1)
+        payload['stale_detail'] = STALE_NOTE
     return payload
 
 
 def _benefits_index_or_error(benefits_client):
+    """Returns (index, error_message, seconds_old).
+
+    index is None exactly when error_message is set. seconds_old is None
+    unless we fell back to an older copy.
+    """
     try:
-        return build_benefits_index(benefits_client.list_all()), None
+        records, age = benefits_client.list_all_or_last_known()
+        return build_benefits_index(records), None, age
     except SourceUnavailable as e:
-        return None, str(e)
+        return None, str(e), None
 
 
 def _resident_index_or_error(rest_client):
+    """Returns (index, error_message, seconds_old). Same shape as above."""
     try:
-        return build_resident_key_index(rest_client.list_all()), None
+        records, age = rest_client.list_all_or_last_known()
+        return build_resident_key_index(records), None, age
     except SourceUnavailable as e:
-        return None, str(e)
+        return None, str(e), None
 
 
 def build_unified_resident(identifier, rest_client, benefits_client, attempt_match=True):
@@ -172,7 +192,7 @@ def build_unified_resident(identifier, rest_client, benefits_client, attempt_mat
             unified['benefits_source'] = _status('not_attempted', NOT_ATTEMPTED_REASON)
             return unified
 
-        benefits_index, benefits_error = _benefits_index_or_error(benefits_client)
+        benefits_index, benefits_error, benefits_age = _benefits_index_or_error(benefits_client)
         if benefits_index is None:
             unified['benefits_source'] = _status('unavailable', benefits_error)
             return unified
@@ -180,12 +200,12 @@ def build_unified_resident(identifier, rest_client, benefits_client, attempt_mat
         # None here means "we could not check the index side", which is
         # different from "we checked and it was unique" - find_benefits_match
         # skips the check rather than assuming it passed.
-        resident_keys, _ = _resident_index_or_error(rest_client)
+        resident_keys, _, _ = _resident_index_or_error(rest_client)
         status, record, reason, confidence = find_benefits_match(
             resident, benefits_index, resident_keys
         )
         unified['benefits'] = record
-        unified['benefits_source'] = _status(status, reason, confidence)
+        unified['benefits_source'] = _status(status, reason, confidence, benefits_age)
         return unified
 
     # Door 2: a Benefits Register ref.
@@ -204,18 +224,18 @@ def build_unified_resident(identifier, rest_client, benefits_client, attempt_mat
             unified['resident_source'] = _status('not_attempted', NOT_ATTEMPTED_REASON)
             return unified
 
-        resident_keys, keys_error = _resident_index_or_error(rest_client)
+        resident_keys, keys_error, resident_age = _resident_index_or_error(rest_client)
         if resident_keys is None:
             unified['resident_source'] = _status('unavailable', keys_error)
             return unified
 
-        benefits_index, _ = _benefits_index_or_error(benefits_client)
+        benefits_index, _, _ = _benefits_index_or_error(benefits_client)
         status, record, reason, confidence = find_resident_match(
             benefit, resident_keys, benefits_index
         )
         unified['resident'] = record
         unified['resident_id'] = record.get('id') if record else None
-        unified['resident_source'] = _status(status, reason, confidence)
+        unified['resident_source'] = _status(status, reason, confidence, resident_age)
         return unified
 
     # Neither door opened. A source we could not reach is not evidence of
@@ -240,7 +260,7 @@ def build_unified_resident(identifier, rest_client, benefits_client, attempt_mat
 
 def build_unified_all(rest_client, benefits_client, attempt_match=True):
     try:
-        residents = rest_client.list_all()
+        residents, resident_age = rest_client.list_all_or_last_known()
     except SourceUnavailable as e:
         # count stays null rather than 0: we did not look and find nothing,
         # we could not look at all, and 0 would assert the former.
@@ -258,9 +278,9 @@ def build_unified_all(rest_client, benefits_client, attempt_match=True):
     benefits_index = None
     benefits_source = _status('not_attempted', NOT_ATTEMPTED_REASON)
     if attempt_match:
-        benefits_index, benefits_error = _benefits_index_or_error(benefits_client)
+        benefits_index, benefits_error, benefits_age = _benefits_index_or_error(benefits_client)
         benefits_source = (
-            _status('ok') if benefits_index is not None
+            _status('ok', stale_seconds=benefits_age) if benefits_index is not None
             else _status('unavailable', benefits_error)
         )
 
@@ -285,7 +305,7 @@ def build_unified_all(rest_client, benefits_client, attempt_match=True):
         results.append(entry)
 
     return {
-        'resident_source': _status('ok'),
+        'resident_source': _status('ok', stale_seconds=resident_age),
         'benefits_source': benefits_source,
         'count': len(results),
         'residents': results,

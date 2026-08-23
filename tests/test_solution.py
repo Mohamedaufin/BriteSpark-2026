@@ -381,6 +381,38 @@ class CachingAndCircuitBreakerTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_recovery_check_asks_health_before_paying_for_the_data_call(self):
+        # /health is exempt from this source's slowness and failures, so it
+        # can answer "is it back?" in one fast request instead of a full
+        # retry-and-backoff cycle against a source we already think is down.
+        server, hits = _counting_stub_server({
+            '/health': (503, 'application/json', '{"status": "down"}'),
+            '/records': (500, 'application/xml', '<Fault/>'),
+        })
+        try:
+            client = BenefitsRegisterClient(
+                f'http://127.0.0.1:{server.server_address[1]}',
+                max_retries=1, retry_base_delay=0.01,
+                breaker_failure_threshold=1, breaker_cooldown=0.2,
+            )
+            with self.assertRaises(SourceUnavailable):
+                client.list_all()  # trips the breaker
+            records_before = hits.get('/records', 0)
+            health_before = hits.get('/health', 0)
+
+            time.sleep(0.25)  # cooldown passes, so the next call is the recovery check
+            with self.assertRaises(SourceUnavailable) as ctx:
+                client.list_all()
+
+            self.assertIn('/health', str(ctx.exception))
+            self.assertGreater(hits.get('/health', 0), health_before,
+                               'the recovery check must probe the cheap endpoint')
+            self.assertEqual(hits.get('/records', 0), records_before,
+                             'a failed probe must not go on to pay for the data call')
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_circuit_breaker_recovers_after_cooldown(self):
         response_map = {
             '/health': (200, 'application/json', '{"status": "ok"}'),
@@ -407,7 +439,106 @@ class CachingAndCircuitBreakerTests(unittest.TestCase):
             data = client.list_all()  # half-open trial call, source now "recovered"
             self.assertEqual(data, {})
             self.assertGreater(hits.get('/records', 0), hits_while_open, 'the recovery trial must actually call upstream')
-            self.assertEqual(client._circuit_state, 'closed')
+            self.assertEqual(client._consecutive_failures, 0,
+                             'a success must clear the failure count')
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class LastKnownDataTests(unittest.TestCase):
+    """"Partial data beats an error page" applied to a source that has gone
+    down since we last read it: serve what we last fetched, say how old it
+    is, and stop serving it once it is too old to vouch for."""
+
+    def test_serves_the_last_copy_when_the_source_stops_answering(self):
+        response_map = {
+            '/health': (200, 'application/json', '{"status": "ok"}'),
+            '/records': (200, 'application/xml', EMPTY_REGISTER_XML),
+        }
+        server, _hits = _counting_stub_server(response_map)
+        try:
+            client = BenefitsRegisterClient(
+                f'http://127.0.0.1:{server.server_address[1]}',
+                max_retries=1, retry_base_delay=0.01,
+                cache_ttl=0.1, max_snapshot_age=30,
+                breaker_failure_threshold=99,  # keep the breaker out of this test
+            )
+            client.list_all()          # one good fetch, so we have something saved
+            time.sleep(0.15)           # let the cache expire
+            response_map['/records'] = (500, 'application/xml', '<Fault/>')
+
+            records, seconds_old = client.list_all_or_last_known()
+            self.assertEqual(records, {})
+            self.assertIsNotNone(seconds_old, 'a fallback answer must report its age')
+            self.assertGreater(seconds_old, 0)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_refuses_to_serve_a_copy_that_is_too_old(self):
+        response_map = {
+            '/health': (200, 'application/json', '{"status": "ok"}'),
+            '/records': (200, 'application/xml', EMPTY_REGISTER_XML),
+        }
+        server, _hits = _counting_stub_server(response_map)
+        try:
+            client = BenefitsRegisterClient(
+                f'http://127.0.0.1:{server.server_address[1]}',
+                max_retries=1, retry_base_delay=0.01,
+                cache_ttl=0.1, max_snapshot_age=0.2,
+                breaker_failure_threshold=99,
+            )
+            client.list_all()
+            time.sleep(0.3)            # past the cache TTL *and* max_snapshot_age
+            response_map['/records'] = (500, 'application/xml', '<Fault/>')
+
+            with self.assertRaises(SourceUnavailable):
+                client.list_all_or_last_known()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_the_response_says_how_old_the_data_is(self):
+        # The adapter knowing the data is old is useless if the caller
+        # cannot tell it apart from a fresh answer.
+        response_map = {
+            '/health': (200, 'application/json', '{"status": "ok"}'),
+            '/residents': (200, 'application/json',
+                           '{"has_more": false, "results": [{"id": "R-1", "first_name": "A", '
+                           '"last_name": "B", "date_of_birth": "2000-01-01"}]}'),
+        }
+        server, _hits = _counting_stub_server(response_map)
+        try:
+            from app.assembly import build_unified_all
+            rest = ResidentIndexClient(f'http://127.0.0.1:{server.server_address[1]}',
+                                       cache_ttl=0.1, max_snapshot_age=30)
+            rest.list_all()
+            time.sleep(0.15)
+            response_map['/residents'] = (500, 'application/json', '{"error": "down"}')
+
+            unreachable = BenefitsRegisterClient('http://127.0.0.1:1')
+            result = build_unified_all(rest, unreachable, attempt_match=False)
+
+            self.assertEqual(result['resident_source']['status'], 'ok')
+            self.assertEqual(result['count'], 1, 'the residents themselves must still be there')
+            self.assertIn('stale_seconds', result['resident_source'])
+            self.assertGreater(result['resident_source']['stale_seconds'], 0)
+            self.assertIn('may have changed', result['resident_source']['stale_detail'])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_fresh_answer_is_not_labelled_stale(self):
+        server, _hits = _counting_stub_server({
+            '/health': (200, 'application/json', '{"status": "ok"}'),
+            '/records': (200, 'application/xml', EMPTY_REGISTER_XML),
+        })
+        try:
+            client = BenefitsRegisterClient(f'http://127.0.0.1:{server.server_address[1]}')
+            records, seconds_old = client.list_all_or_last_known()
+            self.assertEqual(records, {})
+            self.assertIsNone(seconds_old, 'a live answer must not be reported as old')
         finally:
             server.shutdown()
             server.server_close()

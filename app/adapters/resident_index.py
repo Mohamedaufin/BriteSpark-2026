@@ -24,10 +24,11 @@ MAX_PAGES = 10_000  # generous cap against a source that never sets has_more=fal
 
 
 class ResidentIndexClient:
-    def __init__(self, base_url, timeout=5.0, cache_ttl=20.0):
+    def __init__(self, base_url, timeout=5.0, cache_ttl=20.0, max_snapshot_age=120.0):
         self.base_url = base_url.rstrip('/')
         self.timeout = timeout
         self.cache_ttl = cache_ttl
+        self.max_snapshot_age = max_snapshot_age
         self._list_all_cache = None  # (cached_at, {id: record})
 
     def _get_json(self, path):
@@ -104,3 +105,27 @@ class ResidentIndexClient:
 
         self._list_all_cache = (time.monotonic(), by_id)
         return by_id
+
+    def list_all_or_last_known(self):
+        """Fresh data if we can get it; the last data we got if we can't.
+
+        Returns (records, seconds_old). seconds_old is None when the answer
+        is fresh, and the age of the saved copy when it isn't - so the
+        caller can always tell the two apart and say so in the response.
+
+        "Partial data beats an error page": if the source is down but we
+        fetched it successfully a minute ago, that minute-old data is far
+        more use to a staff member than an error - as long as we say how
+        old it is. Past max_snapshot_age we stop vouching for it and fail
+        like normal, because at some point old data stops being useful and
+        starts being misleading.
+        """
+        try:
+            return self.list_all(), None
+        except SourceUnavailable:
+            if self._list_all_cache is not None:
+                cached_at, data = self._list_all_cache
+                age = time.monotonic() - cached_at
+                if age < self.max_snapshot_age:
+                    return data, age
+            raise

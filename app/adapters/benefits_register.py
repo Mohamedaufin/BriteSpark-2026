@@ -3,20 +3,23 @@
 Roughly 1 in 7 calls returns a 500 as a matter of course. A single 500 is not
 "the source is down" - it is Tuesday. We retry with backoff before surfacing
 SourceUnavailable, so a genuinely dead source still looks different from an
-ordinary flaky call to everything upstream of this adapter.
+ordinary flaky call.
 
-Two stretch-goal behaviours live here too, both scoped to this adapter only
-(the REST index doesn't fail in this problem's fixtures, so there's nothing
-to protect it against - see DECISIONS.md):
+Three things happen here, in increasing order of "how bad is it":
 
-- A short-TTL cache on list_all(), the one call path actually on the hot
-  route (?match=basic hits it on every request). Only successful fetches
-  are cached; a failure is never masked behind stale data - see DECISIONS.md
-  for why that's a deliberate line, not an oversight.
-- A circuit breaker around the shared retry path, so a source that is
-  *comprehensively* down (not just its usual ~15%) stops being hammered on
-  every request and fails fast instead of paying the full retry budget
-  every time.
+1. Retry. One 500 is not an outage, it is this source's normal Tuesday.
+   We try up to max_retries times with a growing pause between attempts.
+2. Circuit breaker. If the source fails max_retries times in a row on
+   several requests running, it is not flaky - it is down. We stop calling
+   it for breaker_cooldown seconds instead of making every request wait
+   through the full retry budget to learn the same thing.
+3. Give up. Raise SourceUnavailable, which assembly.py turns into an
+   honest "benefits_source: unavailable" in the response - unless a recent
+   copy is still on hand, in which case list_all_or_last_known() serves
+   that instead, labelled with its age.
+
+There is also a short-TTL cache on list_all(), because this source is slow
+and the same full dump is what every matched lookup needs.
 """
 import random
 import time
@@ -27,15 +30,12 @@ import xml.etree.ElementTree as ET
 
 from app.errors import SourceUnavailable
 
-CIRCUIT_CLOSED = 'closed'
-CIRCUIT_OPEN = 'open'
-CIRCUIT_HALF_OPEN = 'half_open'
-
 
 class BenefitsRegisterClient:
     def __init__(
         self, base_url, timeout=5.0, max_retries=3, retry_base_delay=0.3,
-        cache_ttl=20.0, breaker_failure_threshold=3, breaker_cooldown=15.0,
+        cache_ttl=20.0, max_snapshot_age=120.0,
+        breaker_failure_threshold=3, breaker_cooldown=15.0,
     ):
         self.base_url = base_url.rstrip('/')
         self.timeout = timeout
@@ -43,16 +43,18 @@ class BenefitsRegisterClient:
         self.retry_base_delay = retry_base_delay
 
         self.cache_ttl = cache_ttl
-        self._list_all_cache = None  # (cached_at, {ref: record})
+        self.max_snapshot_age = max_snapshot_age
+        self._cache = None
+        self._cached_at = 0.0
 
+        # The whole circuit breaker is these two numbers.
         self.breaker_failure_threshold = breaker_failure_threshold
         self.breaker_cooldown = breaker_cooldown
-        self._circuit_state = CIRCUIT_CLOSED
-        self._consecutive_failures = 0
-        self._circuit_opened_at = None
+        self._consecutive_failures = 0   # failed requests in a row
+        self._blocked_until = 0.0        # don't call the source before this time
 
-    def _get(self, path):
-        """One raw attempt. Returns (status_code, text)."""
+    def _get_once(self, path):
+        """One HTTP GET, no retrying. Returns (status_code, text)."""
         url = f'{self.base_url}{path}'
         try:
             with urllib.request.urlopen(url, timeout=self.timeout) as resp:
@@ -63,76 +65,92 @@ class BenefitsRegisterClient:
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             raise SourceUnavailable(f'benefits register unreachable: {e}') from e
 
-    def _breaker_allows_call(self):
-        if self._circuit_state == CIRCUIT_OPEN:
-            if time.monotonic() - self._circuit_opened_at >= self.breaker_cooldown:
-                self._circuit_state = CIRCUIT_HALF_OPEN
-                return True
-            return False
-        return True
+    def _get(self, path):
+        """A GET that retries, and that gives up early on a dead source.
 
-    def _breaker_record_success(self):
-        self._circuit_state = CIRCUIT_CLOSED
-        self._consecutive_failures = 0
-        self._circuit_opened_at = None
+        Returns the response text, or None if the source said 404.
 
-    def _breaker_record_failure(self):
-        self._consecutive_failures += 1
-        if self._circuit_state == CIRCUIT_HALF_OPEN or self._consecutive_failures >= self.breaker_failure_threshold:
-            self._circuit_state = CIRCUIT_OPEN
-            self._circuit_opened_at = time.monotonic()
-
-    def _get_with_retry(self, path):
-        """Every caller of the register (list_all, get_by_ref) goes through
-        here, which is exactly why the circuit breaker lives at this single
-        choke point rather than being duplicated per method."""
-        if not self._breaker_allows_call():
+        Every data call goes through here, which is why the breaker lives
+        here and not in each method separately.
+        """
+        # Circuit breaker, part 1: are we currently refusing to call it?
+        if time.monotonic() < self._blocked_until:
+            wait = self._blocked_until - time.monotonic()
             raise SourceUnavailable(
-                f'benefits register circuit breaker is open (comprehensively down; '
-                f'retrying in {self.breaker_cooldown:.0f}s)'
+                f'benefits register looks comprehensively down, so the circuit breaker is '
+                f'not calling it for another {wait:.0f}s'
             )
-        try:
-            result = self._get_with_retry_uncircuited(path)
-        except SourceUnavailable:
-            self._breaker_record_failure()
-            raise
-        self._breaker_record_success()
-        return result
 
-    def _get_with_retry_uncircuited(self, path):
+        # Circuit breaker, part 2: if we had given up on this source and the
+        # cooldown has now passed, this call is the one that finds out
+        # whether it came back. Ask /health first - it is exempt from this
+        # source's slowness and failures, so it answers that question in one
+        # fast request instead of a full retry-and-backoff cycle.
+        if self._consecutive_failures >= self.breaker_failure_threshold:
+            if not self.health():
+                self._blocked_until = time.monotonic() + self.breaker_cooldown
+                raise SourceUnavailable(
+                    f'benefits register /health is still not answering, so the circuit '
+                    f'breaker stays open for another {self.breaker_cooldown:.0f}s'
+                )
+
         last_error = None
         for attempt in range(self.max_retries):
             try:
-                code, text = self._get(path)
+                code, text = self._get_once(path)
             except SourceUnavailable as e:
-                last_error = e
+                last_error = e          # couldn't reach it at all; worth retrying
             else:
                 if code == 200:
+                    # Circuit breaker, part 2: any success clears the count.
+                    self._consecutive_failures = 0
+                    self._blocked_until = 0.0
                     return text
                 if code == 404:
+                    self._consecutive_failures = 0
+                    self._blocked_until = 0.0
                     return None
                 last_error = SourceUnavailable(f'benefits register returned {code}: {text}')
+
             if attempt < self.max_retries - 1:
+                # Wait longer after each failure, plus a little randomness so
+                # repeated calls don't all retry in lockstep.
                 time.sleep(self.retry_base_delay * (2 ** attempt) + random.uniform(0, 0.1))
+
+        # Circuit breaker, part 3: that request failed every attempt. Count
+        # it, and once enough have failed in a row, stop calling for a while.
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self.breaker_failure_threshold:
+            self._blocked_until = time.monotonic() + self.breaker_cooldown
+
         raise last_error or SourceUnavailable('benefits register failed with no detail')
 
     def health(self):
-        """Deliberately bypasses the breaker and the retry loop - the mock
-        service's own README says /health is exempt from both slowness and
-        failure specifically so it stays a reliable up/down signal even
-        while /records is being circuit-broken."""
+        """Is this source up?
+
+        Deliberately skips the retrying and the breaker: the mock service's
+        own README says /health is exempt from the slowness and the failures,
+        so it stays a truthful up/down signal even while /records is failing.
+        """
         try:
-            code, _ = self._get('/health')
+            code, _ = self._get_once('/health')
             return code == 200
         except SourceUnavailable:
             return False
 
     @staticmethod
     def _parse_records(xml_text):
+        """XML text -> a list of plain dictionaries.
+
+        Unparseable XML is treated as the source failing. It is deliberately
+        not retried: a broken response is a fact about that response, so
+        asking again would just fetch the same broken thing.
+        """
         try:
             root = ET.fromstring(xml_text)
         except ET.ParseError as e:
-            raise SourceUnavailable(f'benefits register returned unparseable XML: {e}') from e
+            raise SourceUnavailable(f'benefits register returned XML we cannot parse: {e}') from e
+
         records = []
         for rec in root.findall('Record'):
             records.append({
@@ -147,28 +165,53 @@ class BenefitsRegisterClient:
         return records
 
     def get_by_ref(self, ref):
+        """One benefits record, or None if this source has no such ref."""
         safe_ref = urllib.parse.quote(ref, safe='')
-        text = self._get_with_retry(f'/records/{safe_ref}')
+        text = self._get(f'/records/{safe_ref}')
         if text is None:
             return None
         records = self._parse_records(text)
         return records[0] if records else None
 
     def list_all(self):
-        """Returns {ref: record}. One retried call for the full dump - the
-        register has no pagination, so there is no boundary case to dedupe.
+        """Every benefits record, as {ref: record}.
 
-        Cached for cache_ttl seconds: only a *successful* fetch is cached,
-        and a cache miss/expiry that then fails is never papered over with
-        the old data - see DECISIONS.md for why staleness is bounded to the
-        TTL and never silently extended past it.
+        Cached for cache_ttl seconds, because this source is slow and this
+        is the call every matched lookup needs. Only successful fetches are
+        cached, so a failure is never hidden behind old data.
+
+        No pagination here - the register hands over everything at once, so
+        there is no page-boundary problem like the resident index has.
         """
-        if self._list_all_cache is not None:
-            cached_at, data = self._list_all_cache
-            if time.monotonic() - cached_at < self.cache_ttl:
-                return data
+        if self._cache is not None and time.monotonic() - self._cached_at < self.cache_ttl:
+            return self._cache
 
-        text = self._get_with_retry('/records')
-        data = {} if text is None else {r['ref']: r for r in self._parse_records(text)}
-        self._list_all_cache = (time.monotonic(), data)
-        return data
+        text = self._get('/records')
+        records = {} if text is None else {r['ref']: r for r in self._parse_records(text)}
+
+        self._cache = records
+        self._cached_at = time.monotonic()
+        return records
+
+    def list_all_or_last_known(self):
+        """Fresh data if we can get it; the last data we got if we can't.
+
+        Returns (records, seconds_old). seconds_old is None when the answer
+        is fresh, and the age of the saved copy when it isn't - so the
+        caller can always tell the two apart and say so in the response.
+
+        "Partial data beats an error page": if the register is down but we
+        fetched it successfully a minute ago, that minute-old data is far
+        more use to a staff member than an error - as long as we say how
+        old it is. Past max_snapshot_age we stop vouching for it and fail
+        like normal, because at some point old data stops being useful and
+        starts being misleading.
+        """
+        try:
+            return self.list_all(), None
+        except SourceUnavailable:
+            if self._cache is not None:
+                age = time.monotonic() - self._cached_at
+                if age < self.max_snapshot_age:
+                    return self._cache, age
+            raise

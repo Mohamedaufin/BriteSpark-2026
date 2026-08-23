@@ -23,7 +23,10 @@ def main():
     args = parser.parse_args()
 
     rest_client = ResidentIndexClient(
-        config.REST_BASE_URL, timeout=config.REST_TIMEOUT, cache_ttl=config.REST_CACHE_TTL
+        config.REST_BASE_URL,
+        timeout=config.REST_TIMEOUT,
+        cache_ttl=config.REST_CACHE_TTL,
+        max_snapshot_age=config.REST_MAX_SNAPSHOT_AGE,
     )
     benefits_client = BenefitsRegisterClient(
         config.XML_BASE_URL,
@@ -31,6 +34,7 @@ def main():
         max_retries=config.XML_MAX_RETRIES,
         retry_base_delay=config.XML_RETRY_BASE_DELAY,
         cache_ttl=config.XML_CACHE_TTL,
+        max_snapshot_age=config.XML_MAX_SNAPSHOT_AGE,
         breaker_failure_threshold=config.XML_BREAKER_FAILURE_THRESHOLD,
         breaker_cooldown=config.XML_BREAKER_COOLDOWN,
     )
