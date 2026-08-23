@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BriteSpark — Unified Resident View</title>
+<style>
+  :root {
+    --bg: #0f1420; --card: #171d2e; --border: #2a3348; --text: #e8ecf4;
+    --muted: #8b95ab; --accent: #5b8def; --ok: #3ecf8e; --warn: #f2b84b; --bad: #ef6461;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 40px 20px; background: var(--bg); color: var(--text);
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    display: flex; justify-content: center;
+  }
+  .app { width: 100%; max-width: 640px; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 28px; font-size: 0.9rem; }
+  .search-row { display: flex; gap: 8px; margin-bottom: 10px; }
+  input[type=text] {
+    flex: 1; background: var(--card); border: 1px solid var(--border); color: var(--text);
+    padding: 10px 12px; border-radius: 8px; font-size: 0.95rem;
+  }
+  button {
+    background: var(--accent); color: white; border: none; border-radius: 8px;
+    padding: 10px 18px; font-size: 0.95rem; cursor: pointer; white-space: nowrap;
+  }
+  button:hover { opacity: 0.9; }
+  button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  label.toggle { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 0.85rem; margin-bottom: 22px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px 18px; margin-bottom: 14px;
+  }
+  .card h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 12px; }
+  .row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 0.92rem; border-bottom: 1px dashed var(--border); }
+  .row:last-child { border-bottom: none; }
+  .row .k { color: var(--muted); }
+  .status { display: inline-flex; align-items: center; gap: 6px; font-size: 0.82rem; padding: 3px 9px; border-radius: 999px; }
+  .status.ok, .status.matched { background: rgba(62,207,142,0.15); color: var(--ok); }
+  .status.not_found, .status.unavailable { background: rgba(239,100,97,0.15); color: var(--bad); }
+  .status.no_match, .status.ambiguous, .status.not_attempted { background: rgba(242,184,75,0.15); color: var(--warn); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .dot.up { background: var(--ok); } .dot.down { background: var(--bad); }
+  .sources .row { border: none; padding: 6px 0; }
+  .empty { color: var(--muted); font-size: 0.9rem; padding: 8px 0; }
+  .footer-row { display: flex; justify-content: flex-end; margin-top: 18px; }
+  .reason { color: var(--muted); font-size: 0.82rem; margin-top: 8px; }
+  .friendly { font-size: 0.95rem; font-weight: 600; }
+  .friendly.tone-ok { color: var(--ok); }
+  .friendly.tone-bad { color: var(--bad); }
+  .friendly.tone-warn { color: var(--warn); }
+  .tech-status { display: block; color: var(--muted); font-size: 0.72rem; font-weight: 400; margin-top: 2px; }
+  .degraded-note { background: rgba(242,184,75,0.08); border: 1px solid rgba(242,184,75,0.3); border-radius: 8px; padding: 10px 12px; font-size: 0.85rem; color: var(--text); margin-bottom: 4px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <h1>BriteSpark — Unified Resident View</h1>
+  <p class="sub">A thin display client of the actual backend API. Nothing here recomputes anything — every value shown is exactly what <code>/unified/residents/&lt;identifier&gt;</code> returned. Either identifier opens the view.</p>
+
+  <div class="search-row">
+    <input type="text" id="residentId" placeholder="Resident id (R-10697) or register ref (NO/2019/4697)" value="R-10697">
+    <button id="searchBtn">Search</button>
+  </div>
+  <label class="toggle">
+    <input type="checkbox" id="matchToggle" checked>
+    Attempt cross-source match (on by default; unticking adds <code>?match=off</code>)
+  </label>
+
+  <div class="card sources">
+    <h2>Sources</h2>
+    <div class="row"><span class="k">Resident Index</span><span id="restHealth"><span class="dot"></span> checking…</span></div>
+    <div class="row"><span class="k">Benefits Register</span><span id="xmlHealth"><span class="dot"></span> checking…</span></div>
+  </div>
+
+  <div class="card" id="residentCard" style="display:none">
+    <h2>👤 Resident Information</h2>
+    <div id="residentFriendly"></div>
+    <div id="residentBody"></div>
+  </div>
+
+  <div class="card" id="benefitsCard" style="display:none">
+    <h2>💰 Benefits Information</h2>
+    <div id="benefitsFriendly"></div>
+    <div id="benefitsBody"></div>
+  </div>
+
+  <div class="footer-row">
+    <button class="ghost" id="apiLink">⚙ Backend API →</button>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+// Friendly presentation only - the underlying status string is what the
+// API actually returns (see DECISIONS.md); this just chooses how a human
+// reads it. The raw value is always shown too, in small print.
+const RESIDENT_LABELS = {
+  ok:            { text: '🟢 Available',                      tone: 'ok' },
+  matched:       { text: '✅ Resident record matched',        tone: 'ok' },
+  not_found:     { text: '❌ No such resident',               tone: 'bad' },
+  no_match:      { text: 'ℹ️ No matching resident record',    tone: 'warn' },
+  ambiguous:     { text: '⚠️ Multiple possible residents',    tone: 'warn' },
+  unavailable:   { text: '⚠️ Temporarily unavailable',        tone: 'bad' },
+  not_attempted: { text: '➖ Not attempted',                   tone: 'warn' },
+};
+const BENEFITS_LABELS = {
+  ok:            { text: '🟢 Available',                      tone: 'ok' },
+  matched:       { text: '✅ Benefits record matched',        tone: 'ok' },
+  no_match:      { text: 'ℹ️ No matching benefits record',    tone: 'warn' },
+  ambiguous:     { text: '⚠️ Multiple possible matches',      tone: 'warn' },
+  not_found:     { text: '❌ No such benefits record',        tone: 'bad' },
+  unavailable:   { text: '⚠️ Temporarily unavailable',        tone: 'bad' },
+  not_attempted: { text: '➖ Not attempted',                   tone: 'warn' },
+};
+
+// A confidence, when the API states one, belongs next to the claim it qualifies.
+function confidenceHtml(source) {
+  if (source.confidence === undefined || source.confidence === null) return '';
+  const pct = (source.confidence * 100).toFixed(0);
+  return `<div class="reason">Confidence ${pct}% — ${source.confidence_basis || ''}</div>`;
+}
+
+function friendlyHtml(labels, status) {
+  const l = labels[status] || { text: status, tone: 'warn' };
+  return `<div class="friendly tone-${l.tone}">${l.text}<span class="tech-status">Source status: ${status}</span></div>`;
+}
+
+function fmtDate(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso + 'T00:00:00Z');
+  if (isNaN(d)) return iso;
+  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
+}
+
+async function refreshHealth() {
+  try {
+    const h = await (await fetch('/health')).json();
+    $('restHealth').innerHTML = `<span class="dot ${h.resident_index === 'up' ? 'up' : 'down'}"></span> ${h.resident_index}`;
+    $('xmlHealth').innerHTML = `<span class="dot ${h.benefits_register === 'up' ? 'up' : 'down'}"></span> ${h.benefits_register}`;
+  } catch (e) {
+    $('restHealth').textContent = 'unreachable';
+    $('xmlHealth').textContent = 'unreachable';
+  }
+}
+
+function renderResident(d) {
+  const card = $('residentCard');
+  card.style.display = 'block';
+  $('residentFriendly').innerHTML = friendlyHtml(RESIDENT_LABELS, d.resident_source.status);
+  if (!d.resident) {
+    // "Unavailable" is the only one of these that means we failed to look.
+    // The rest mean we looked and this is the honest answer.
+    $('residentBody').innerHTML = d.resident_source.status === 'unavailable'
+      ? `<div class="degraded-note">We could not retrieve Resident Index data right now.` +
+        (d.resident_source.error ? `<div class="reason">${d.resident_source.error}</div>` : '') + `</div>`
+      : `<div class="empty">${d.resident_source.error || 'No resident record.'}</div>`;
+    return;
+  }
+  const r = d.resident;
+  $('residentBody').innerHTML = `
+    <div class="row"><span class="k">Name</span><span>${r.first_name} ${r.last_name}</span></div>
+    <div class="row"><span class="k">Date of birth</span><span>${fmtDate(r.date_of_birth)}</span></div>
+    <div class="row"><span class="k">Address</span><span>${r.address_line}, ${r.city}</span></div>
+    <div class="row"><span class="k">Phone</span><span>${r.phone}</span></div>
+    <div class="row"><span class="k">Program status</span><span>${r.program_status}</span></div>
+    <div class="row"><span class="k">Last contact</span><span>${fmtDate(r.last_contact)}</span></div>
+  ` + confidenceHtml(d.resident_source);
+}
+
+function renderBenefits(d) {
+  const card = $('benefitsCard');
+  card.style.display = 'block';
+  $('benefitsFriendly').innerHTML = friendlyHtml(BENEFITS_LABELS, d.benefits_source.status);
+  if (!d.benefits) {
+    if (d.benefits_source.status === 'unavailable') {
+      $('benefitsBody').innerHTML = `
+        <div class="degraded-note">
+          We could not retrieve Benefits Register data.<br>Resident information is still available above.
+          <div class="reason">${d.benefits_source.error || ''}</div>
+        </div>`;
+    } else {
+      $('benefitsBody').innerHTML = `<div class="empty">${d.benefits_source.error || 'No benefits record.'}</div>`;
+    }
+    return;
+  }
+  const b = d.benefits;
+  $('benefitsBody').innerHTML = `
+    <div class="row"><span class="k">Benefit code</span><span>${b.benefit_code}</span></div>
+    <div class="row"><span class="k">Review due</span><span>${fmtDate(b.review_due)}</span></div>
+    <div class="row"><span class="k">Register address</span><span>${b.addr}, ${b.town}</span></div>
+    <div class="row"><span class="k">Reference</span><span>${b.ref}</span></div>
+  ` + confidenceHtml(d.benefits_source);
+}
+
+async function search() {
+  const id = $('residentId').value.trim();
+  if (!id) return;
+  const match = $('matchToggle').checked;
+  // Matching is on by default server-side, so the flag we send is the opt-out.
+  const path = `/unified/residents/${encodeURIComponent(id)}${match ? '' : '?match=off'}`;
+  $('apiLink').onclick = () => window.open(path, '_blank');
+
+  $('residentCard').style.display = 'block';
+  $('residentFriendly').innerHTML = '';
+  $('residentBody').innerHTML = '<div class="empty">Loading…</div>';
+  $('benefitsCard').style.display = 'none';
+
+  try {
+    const res = await fetch(path);
+    const d = await res.json();
+    renderResident(d);
+    renderBenefits(d);
+  } catch (e) {
+    $('residentCard').style.display = 'block';
+    $('residentBody').innerHTML = `<div class="empty">Request failed: ${e}</div>`;
+    $('benefitsCard').style.display = 'none';
+  }
+}
+
+$('searchBtn').addEventListener('click', search);
+$('residentId').addEventListener('keydown', (e) => { if (e.key === 'Enter') search(); });
+$('matchToggle').addEventListener('change', search);
+$('apiLink').addEventListener('click', () => window.open('/health', '_blank'));
+
+refreshHealth();
+search();
+</script>
+</body>
+</html>
