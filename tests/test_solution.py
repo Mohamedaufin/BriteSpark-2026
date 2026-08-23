@@ -92,11 +92,32 @@ class ResidentIndexDedupTests(unittest.TestCase):
         self.assertEqual(len(residents), expected_total)
 
     def test_list_all_is_idempotent_across_calls(self):
-        client = ResidentIndexClient(f'http://127.0.0.1:{REST_PORT}')
+        # cache_ttl=0 on purpose. With caching on, the second call would
+        # return the first call's dict and this test would pass without
+        # ever re-walking the source - proving the cache works, not that
+        # de-duplication is stable. The boundary-slip is nondeterministic,
+        # so it has to be two real walks to mean anything.
+        client = ResidentIndexClient(f'http://127.0.0.1:{REST_PORT}', cache_ttl=0)
         first = client.list_all()
         second = client.list_all()
         self.assertEqual(set(first.keys()), set(second.keys()))
         self.assertEqual(first, second)
+
+    def test_list_all_is_cached_within_ttl(self):
+        server, hits = _counting_stub_server({
+            '/health': (200, 'application/json', '{"status": "ok"}'),
+            '/residents': (200, 'application/json',
+                           '{"has_more": false, "results": [{"id": "R-1"}]}'),
+        })
+        try:
+            port = server.server_address[1]
+            client = ResidentIndexClient(f'http://127.0.0.1:{port}', cache_ttl=60)
+            client.list_all()
+            client.list_all()
+            self.assertEqual(hits.get('/residents', 0), 1)
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 class BenefitsRegisterResilienceTests(unittest.TestCase):
@@ -128,8 +149,17 @@ class UnifiedAssemblyTests(unittest.TestCase):
         residents = self.rest.list_all()
         self.some_id = next(iter(residents))
 
-    def test_default_does_not_attempt_matching(self):
-        result = build_unified_resident(self.some_id, self.rest, self.healthy_benefits)
+    def test_default_delivers_the_unified_view_without_a_flag(self):
+        # "One call, one resident, everything known about them" - the default
+        # call has to be the one that does that.
+        result = build_unified_resident('R-10697', self.rest, self.healthy_benefits)
+        self.assertEqual(result['benefits_source']['status'], 'matched')
+        self.assertIsNotNone(result['benefits'])
+
+    def test_matching_can_be_turned_off_explicitly(self):
+        result = build_unified_resident(
+            'R-10697', self.rest, self.healthy_benefits, attempt_match=False
+        )
         self.assertEqual(result['benefits_source']['status'], 'not_attempted')
         self.assertIsNone(result['benefits'])
 
@@ -141,6 +171,29 @@ class UnifiedAssemblyTests(unittest.TestCase):
         self.assertEqual(result['benefits_source']['status'], 'matched')
         self.assertIsNotNone(result['benefits'])
         self.assertEqual(result['benefits']['ref'], 'NO/2019/4697')
+
+    def test_a_match_states_its_confidence(self):
+        # The stretch goal asks for matching "with a stated confidence", so
+        # the number belongs in the response, not only in DECISIONS.md.
+        result = build_unified_resident('R-10697', self.rest, self.healthy_benefits)
+        self.assertIn('confidence', result['benefits_source'])
+        self.assertGreater(result['benefits_source']['confidence'], 0.9)
+        self.assertIn('confidence_basis', result['benefits_source'])
+
+    def test_the_register_ref_is_also_a_door(self):
+        # Staff holding NO/2019/4697 should not be told to find an index id
+        # first - that is the whole point of "no wrong door".
+        result = build_unified_resident('NO/2019/4697', self.rest, self.healthy_benefits)
+        self.assertEqual(result['found_by'], 'register_ref')
+        self.assertEqual(result['benefits_source']['status'], 'ok')
+        self.assertEqual(result['resident_source']['status'], 'matched')
+        self.assertEqual(result['resident']['id'], 'R-10697')
+
+    def test_both_doors_reach_the_same_pair(self):
+        by_id = build_unified_resident('R-10697', self.rest, self.healthy_benefits)
+        by_ref = build_unified_resident('NO/2019/4697', self.rest, self.healthy_benefits)
+        self.assertEqual(by_id['resident'], by_ref['resident'])
+        self.assertEqual(by_id['benefits'], by_ref['benefits'])
 
     def test_no_match_when_no_benefits_record_shares_the_key(self):
         # R-10394 / Paul Quill has no counterpart in the benefits register.
@@ -175,9 +228,42 @@ class UnifiedAssemblyTests(unittest.TestCase):
         index = build_benefits_index(xml_records)
         resident = {'first_name': 'John', 'last_name': 'Smith', 'date_of_birth': '1980-01-01'}
         from app.assembly import find_benefits_match
-        status, record, reason = find_benefits_match(resident, index)
+        status, record, reason, confidence = find_benefits_match(resident, index)
         self.assertEqual(status, 'ambiguous')
         self.assertIsNone(record)
+        self.assertIsNone(confidence)
+
+    def test_two_residents_sharing_a_key_cannot_both_claim_one_register_row(self):
+        # The quiet direction of the same problem: one register record, but
+        # two residents it could belong to. Attaching it to either would be
+        # a silent guess, which is the failure this problem punishes.
+        from app.assembly import build_resident_key_index, find_benefits_match
+
+        xml_records = {'A': {'ref': 'A', 'name': 'SMITH, John', 'born': '1980-01-01'}}
+        residents = {
+            'R-1': {'id': 'R-1', 'first_name': 'John', 'last_name': 'Smith',
+                    'date_of_birth': '1980-01-01'},
+            'R-2': {'id': 'R-2', 'first_name': 'John', 'last_name': 'Smith',
+                    'date_of_birth': '1980-01-01'},
+        }
+        benefits_index = build_benefits_index(xml_records)
+        resident_keys = build_resident_key_index(residents)
+
+        status, record, reason, confidence = find_benefits_match(
+            residents['R-1'], benefits_index, resident_keys
+        )
+        self.assertEqual(status, 'ambiguous')
+        self.assertIsNone(record)
+        self.assertIn('residents share', reason)
+
+    def test_population_count_is_null_not_zero_when_the_index_is_down(self):
+        # "0 residents" asserts we looked and found none. We could not look.
+        from app.assembly import build_unified_all
+        dead_index = ResidentIndexClient('http://127.0.0.1:9')  # nothing listens here
+        result = build_unified_all(dead_index, self.healthy_benefits)
+        self.assertEqual(result['resident_source']['status'], 'unavailable')
+        self.assertIsNone(result['count'])
+        self.assertEqual(result['residents'], [])
 
 
 def _stub_server(response_map):

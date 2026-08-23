@@ -3,8 +3,16 @@
 The index is mostly reliable but its sort key can shift while a client is
 paging, which serves some records on two consecutive pages. list_all()
 collapses that by keying on id rather than trusting page boundaries.
+
+list_all() is cached on the same terms as the benefits register's: only
+successful walks are cached, and a failure is never served from stale data.
+The index isn't slow the way the register is, so this isn't a latency fix -
+it's here because a full page walk is now on the single-resident path (both
+the register-ref door and the reverse-ambiguity check need the whole
+population), and paying 25 page requests per lookup would be careless.
 """
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -16,9 +24,11 @@ MAX_PAGES = 10_000  # generous cap against a source that never sets has_more=fal
 
 
 class ResidentIndexClient:
-    def __init__(self, base_url, timeout=5.0):
+    def __init__(self, base_url, timeout=5.0, cache_ttl=20.0):
         self.base_url = base_url.rstrip('/')
         self.timeout = timeout
+        self.cache_ttl = cache_ttl
+        self._list_all_cache = None  # (cached_at, {id: record})
 
     def _get_json(self, path):
         """Fetch and parse. A response we can't even parse as JSON is treated
@@ -69,6 +79,11 @@ class ResidentIndexClient:
         an unbounded walk is a hang by another name, just one no per-call
         timeout catches on its own.
         """
+        if self._list_all_cache is not None:
+            cached_at, data = self._list_all_cache
+            if time.monotonic() - cached_at < self.cache_ttl:
+                return data
+
         by_id = {}
         page = 1
         while True:
@@ -86,4 +101,6 @@ class ResidentIndexClient:
             if not body.get('has_more'):
                 break
             page += 1
+
+        self._list_all_cache = (time.monotonic(), by_id)
         return by_id

@@ -1,7 +1,8 @@
 """Command-line demo of the unified resident view, no HTTP server required.
 
-    python -m app.cli R-10234
-    python -m app.cli R-10234 --match
+    python -m app.cli R-10697
+    python -m app.cli NO/2019/4697        (either identifier opens the view)
+    python -m app.cli R-10697 --no-match
     python -m app.cli --demo
 """
 import argparse
@@ -15,12 +16,15 @@ from app.assembly import build_unified_resident
 
 def main():
     parser = argparse.ArgumentParser(description='Unified resident view CLI')
-    parser.add_argument('resident_id', nargs='?', help='e.g. R-10234')
-    parser.add_argument('--match', action='store_true', help='attempt best-effort name+DOB matching')
+    parser.add_argument('identifier', nargs='?', help='resident id (R-10697) or register ref (NO/2019/4697)')
+    parser.add_argument('--no-match', dest='match', action='store_false',
+                        help='skip cross-source matching (on by default)')
     parser.add_argument('--demo', action='store_true', help='walk the index and print the first few residents')
     args = parser.parse_args()
 
-    rest_client = ResidentIndexClient(config.REST_BASE_URL, timeout=config.REST_TIMEOUT)
+    rest_client = ResidentIndexClient(
+        config.REST_BASE_URL, timeout=config.REST_TIMEOUT, cache_ttl=config.REST_CACHE_TTL
+    )
     benefits_client = BenefitsRegisterClient(
         config.XML_BASE_URL,
         timeout=config.XML_TIMEOUT,
@@ -39,10 +43,10 @@ def main():
             print()
         return
 
-    if not args.resident_id:
-        parser.error('resident_id is required unless --demo is given')
+    if not args.identifier:
+        parser.error('an identifier is required unless --demo is given')
 
-    print(json.dumps(build_unified_resident(args.resident_id, rest_client, benefits_client, args.match), indent=2))
+    print(json.dumps(build_unified_resident(args.identifier, rest_client, benefits_client, args.match), indent=2))
 
 
 if __name__ == '__main__':

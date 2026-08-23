@@ -1,6 +1,14 @@
 """Unified Resident View API.
 
     python -m app.api [--port 8090]
+
+Endpoints
+    GET /health
+    GET /unified/residents/<identifier>[?match=off]
+    GET /unified/residents[?match=off]
+
+<identifier> is either a Resident Index id (R-10697) or a Benefits Register
+ref (NO/2019/4697). Whichever the caller holds opens the same view.
 """
 import argparse
 import json
@@ -12,7 +20,9 @@ from app.adapters.benefits_register import BenefitsRegisterClient
 from app.adapters.resident_index import ResidentIndexClient
 from app.assembly import build_unified_all, build_unified_resident
 
-rest_client = ResidentIndexClient(config.REST_BASE_URL, timeout=config.REST_TIMEOUT)
+rest_client = ResidentIndexClient(
+    config.REST_BASE_URL, timeout=config.REST_TIMEOUT, cache_ttl=config.REST_CACHE_TTL
+)
 benefits_client = BenefitsRegisterClient(
     config.XML_BASE_URL,
     timeout=config.XML_TIMEOUT,
@@ -44,7 +54,13 @@ class Handler(BaseHTTPRequestHandler):
     def _route(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
-        attempt_match = q.get('match', [''])[0] == 'basic'
+        # Matching is on by default: the problem asks for "one call, one
+        # resident, everything known about them", and a flag the caller has
+        # to know about does not deliver that. Declining is always safe -
+        # the worst case is no_match or ambiguous, never a wrong merge - so
+        # there is nothing to protect the floor from by defaulting it off.
+        # ?match=off (or none/false/0) opts out.
+        attempt_match = q.get('match', [''])[0].lower() not in ('off', 'none', 'false', '0')
 
         if u.path == '/health':
             return self._send(200, {
@@ -55,10 +71,13 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         if u.path.startswith('/unified/residents/'):
-            resident_id = unquote(u.path[len('/unified/residents/'):])
-            if not resident_id:
+            # Everything after the prefix, not just the next segment: a
+            # register ref (NO/2019/4697) contains slashes, and it is a
+            # legitimate identifier here. Percent-encoded refs work too.
+            identifier = unquote(u.path[len('/unified/residents/'):])
+            if not identifier:
                 return self._send(404, {'error': 'no_such_endpoint', 'path': u.path})
-            result = build_unified_resident(resident_id, rest_client, benefits_client, attempt_match)
+            result = build_unified_resident(identifier, rest_client, benefits_client, attempt_match)
             return self._send(200, result)
 
         if u.path == '/unified/residents':
