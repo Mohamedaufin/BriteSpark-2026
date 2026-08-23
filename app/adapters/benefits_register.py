@@ -1,6 +1,7 @@
 """Client for the Benefits Register (legacy XML, slow and unreliable).
 
-Roughly 1 in 7 calls returns a 500 as a matter of course. A single 500 is not
+Roughly 4 in 10 calls returns a 500 as a matter of course (raised
+permanently from 1 in 7 on day two; see DECISIONS.md). A single 500 is not
 "the source is down" - it is Tuesday. We retry with backoff before surfacing
 SourceUnavailable, so a genuinely dead source still looks different from an
 ordinary flaky call.
