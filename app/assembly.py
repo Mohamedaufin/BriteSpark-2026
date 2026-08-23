@@ -18,15 +18,17 @@ from app.errors import SourceUnavailable
 # The match rule is deterministic - exact equality on a normalized triple -
 # so every match it produces rests on identical evidence. This number is the
 # measured precision of that rule against the data pack's hidden ground truth
-# (scripts/match_accuracy_check.py: 306 correct, 0 wrong), not a per-pair
-# score invented at runtime. It is stated as 0.99 rather than 1.0 because
-# "no false positives in 306 cases" is evidence of a very good rule, not
-# proof of an infallible one.
+# (scripts/match_accuracy_check.py: 306/340 true pairs found, 0 wrong), not a
+# per-pair score invented at runtime. It is stated as 0.99 rather than 1.0
+# because "0 false positives across every match attempted" is evidence of a
+# very good rule, not proof of an infallible one - and it says nothing about
+# the 34/340 declined for a blank DOB, which is a recall gap, not a precision
+# claim this number is making.
 MATCH_CONFIDENCE = 0.99
 MATCH_BASIS = (
     'exact match on normalized (last name, first name, date of birth), unique on '
-    'both sides; measured 306/306 correct with no false positives against the '
-    'data pack ground truth - see DECISIONS.md'
+    'both sides; measured against the data pack ground truth at 306/340 true pairs '
+    'found (90% recall) with 0 false positives (100% precision) - see DECISIONS.md'
 )
 
 NOT_ATTEMPTED_REASON = 'cross-source matching was disabled for this request (match=off)'
