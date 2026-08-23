@@ -204,6 +204,129 @@ def _stub_server(response_map):
     return server
 
 
+def _counting_stub_server(response_map):
+    """Like _stub_server, but tracks how many requests actually reached
+    each path - the only way to prove caching and the circuit breaker are
+    doing anything rather than just not raising."""
+    hits = {}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            path = urlparse(self.path).path
+            hits[path] = hits.get(path, 0) + 1
+            status, ctype, body = response_map.get(path, (404, 'text/plain', 'not found'))
+            b = body.encode('utf-8')
+            self.send_response(status)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Content-Length', str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        def log_message(self, fmt, *a):
+            pass
+
+    server = HTTPServer(('127.0.0.1', 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, hits
+
+
+EMPTY_REGISTER_XML = '<?xml version="1.0"?><BenefitsRegister></BenefitsRegister>'
+
+
+class CachingAndCircuitBreakerTests(unittest.TestCase):
+    """Both stretch goals from the problem doc: 'a slow source is not slow
+    on every call' (caching) and 'a source that is comprehensively down
+    stops being called on every request' (circuit breaking)."""
+
+    def test_list_all_is_cached_within_ttl(self):
+        server, hits = _counting_stub_server({
+            '/health': (200, 'application/json', '{"status": "ok"}'),
+            '/records': (200, 'application/xml', EMPTY_REGISTER_XML),
+        })
+        try:
+            port = server.server_address[1]
+            client = BenefitsRegisterClient(f'http://127.0.0.1:{port}', cache_ttl=60)
+            client.list_all()
+            client.list_all()
+            client.list_all()
+            self.assertEqual(hits.get('/records', 0), 1, 'three calls within the TTL should hit upstream once')
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_cache_expires_after_ttl(self):
+        server, hits = _counting_stub_server({
+            '/health': (200, 'application/json', '{"status": "ok"}'),
+            '/records': (200, 'application/xml', EMPTY_REGISTER_XML),
+        })
+        try:
+            port = server.server_address[1]
+            client = BenefitsRegisterClient(f'http://127.0.0.1:{port}', cache_ttl=0.2)
+            client.list_all()
+            time.sleep(0.3)
+            client.list_all()
+            self.assertEqual(hits.get('/records', 0), 2, 'a call after the TTL expires should hit upstream again')
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_circuit_breaker_opens_after_threshold_and_fails_fast(self):
+        server, hits = _counting_stub_server({
+            '/health': (200, 'application/json', '{"status": "ok"}'),
+            '/records': (500, 'application/xml', '<Fault/>'),
+        })
+        try:
+            port = server.server_address[1]
+            client = BenefitsRegisterClient(
+                f'http://127.0.0.1:{port}', max_retries=1, retry_base_delay=0.01,
+                breaker_failure_threshold=2, breaker_cooldown=60,
+            )
+            with self.assertRaises(SourceUnavailable):
+                client.list_all()
+            with self.assertRaises(SourceUnavailable):
+                client.list_all()
+            hits_once_open = hits.get('/records', 0)
+
+            with self.assertRaises(SourceUnavailable) as ctx:
+                client.list_all()
+            self.assertIn('circuit breaker', str(ctx.exception))
+            self.assertEqual(hits.get('/records', 0), hits_once_open, 'an open breaker must not touch the network')
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_circuit_breaker_recovers_after_cooldown(self):
+        response_map = {
+            '/health': (200, 'application/json', '{"status": "ok"}'),
+            '/records': (500, 'application/xml', '<Fault/>'),
+        }
+        server, hits = _counting_stub_server(response_map)
+        try:
+            port = server.server_address[1]
+            client = BenefitsRegisterClient(
+                f'http://127.0.0.1:{port}', max_retries=1, retry_base_delay=0.01,
+                breaker_failure_threshold=1, breaker_cooldown=0.2,
+            )
+            with self.assertRaises(SourceUnavailable):
+                client.list_all()  # trips the breaker
+
+            with self.assertRaises(SourceUnavailable) as ctx:
+                client.list_all()  # breaker open, should fail fast
+            self.assertIn('circuit breaker', str(ctx.exception))
+            hits_while_open = hits.get('/records', 0)
+
+            response_map['/records'] = (200, 'application/xml', EMPTY_REGISTER_XML)
+            time.sleep(0.25)  # let the cooldown elapse
+
+            data = client.list_all()  # half-open trial call, source now "recovered"
+            self.assertEqual(data, {})
+            self.assertGreater(hits.get('/records', 0), hits_while_open, 'the recovery trial must actually call upstream')
+            self.assertEqual(client._circuit_state, 'closed')
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 class MalformedUpstreamTests(unittest.TestCase):
     """The real mock services never send garbage - these simulate the case
     anyway, since a well-behaved adapter shouldn't only survive the failure

@@ -26,6 +26,9 @@ def main():
         timeout=config.XML_TIMEOUT,
         max_retries=config.XML_MAX_RETRIES,
         retry_base_delay=config.XML_RETRY_BASE_DELAY,
+        cache_ttl=config.XML_CACHE_TTL,
+        breaker_failure_threshold=config.XML_BREAKER_FAILURE_THRESHOLD,
+        breaker_cooldown=config.XML_BREAKER_COOLDOWN,
     )
 
     if args.demo:
