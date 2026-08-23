@@ -15,7 +15,7 @@ import unittest
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import patch
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -119,6 +119,50 @@ class ResidentIndexDedupTests(unittest.TestCase):
             client.list_all()
             client.list_all()
             self.assertEqual(hits.get('/residents', 0), 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_mid_pagination_failure_returns_partial_with_a_reason(self):
+        """A first-ever walk (nothing cached yet to fall back on) that
+        breaks partway through must not discard the pages already
+        collected - page 1 succeeds, page 2 breaks, page 1's resident
+        should still come back, flagged as incomplete rather than lost."""
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                path = urlparse(self.path).path
+                if path == '/health':
+                    status, ctype, body = 200, 'application/json', b'{"status": "ok"}'
+                elif path == '/residents':
+                    page = parse_qs(urlparse(self.path).query).get('page', ['1'])[0]
+                    if page == '1':
+                        status, ctype = 200, 'application/json'
+                        body = b'{"has_more": true, "results": [{"id": "R-1"}]}'
+                    else:
+                        status, ctype, body = 500, 'application/json', b'{"error": "boom"}'
+                else:
+                    status, ctype, body = 404, 'text/plain', b'not found'
+                self.send_response(status)
+                self.send_header('Content-Type', ctype)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, fmt, *a):
+                pass
+
+        server = HTTPServer(('127.0.0.1', 0), _Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            client = ResidentIndexClient(f'http://127.0.0.1:{server.server_address[1]}')
+            with self.assertRaises(SourceUnavailable):
+                client.list_all()  # the documented contract: complete, or raise
+
+            records, seconds_old, partial_reason = client.list_all_or_last_known()
+            self.assertEqual(list(records.keys()), ['R-1'], 'page 1 was collected before page 2 broke')
+            self.assertIsNone(seconds_old, 'this is a same-walk partial result, not an aged cache')
+            self.assertIsNotNone(partial_reason, 'caller must be told this list is incomplete')
+            self.assertIn('1', partial_reason)
         finally:
             server.shutdown()
             server.server_close()
@@ -593,8 +637,10 @@ class MalformedUpstreamTests(unittest.TestCase):
 
     def test_pagination_walk_is_bounded_against_a_source_that_never_stops(self):
         # A source that pathologically never sets has_more=false would
-        # otherwise page forever - each individual call has a timeout, but
-        # the walk itself didn't, until MAX_PAGES capped it.
+        # otherwise page forever. Each individual call has a timeout, but
+        # the walk itself didn't, until MAX_PAGES capped it - an endless
+        # loop is the same "your API hangs" failure as a slow request,
+        # reached by a different door.
         server = _stub_server({
             '/health': (200, 'application/json', '{"status": "ok"}'),
             '/residents': (200, 'application/json', '{"has_more": true, "results": [{"id": "R-1"}]}'),

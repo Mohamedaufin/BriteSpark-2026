@@ -34,6 +34,11 @@ class ResidentIndexClient:
         # time we fetched it. Nothing cleverer than that.
         self._cache = None
         self._cached_at = 0.0
+        # Whatever the most recent failed walk had collected before it
+        # failed - None once a walk succeeds or hasn't run yet. Only ever
+        # read as a last-resort fallback in list_all_or_last_known(); never
+        # cached as _cache, so it can't be silently served as a complete list.
+        self._last_partial = None
 
     def _get(self, path):
         """One HTTP GET. Returns (status_code, parsed_json).
@@ -85,62 +90,89 @@ class ResidentIndexClient:
 
         Cached for cache_ttl seconds. Only successful walks are cached, so a
         failure is never hidden behind old data.
+
+        A failure partway through - page 7 of 10 breaks - still raises here,
+        discarding nothing silently: this method's contract stays "complete
+        or an exception." Whatever pages *were* collected before the break
+        is stashed in _last_partial for list_all_or_last_known() to use as a
+        last-resort fallback, never returned from here directly.
         """
         if self._cache is not None and time.monotonic() - self._cached_at < self.cache_ttl:
             return self._cache
 
         by_id = {}
-        page = 1
-        while True:
-            if page > MAX_PAGES:
-                raise SourceUnavailable(
-                    f'resident index never said has_more=false after {MAX_PAGES} pages'
-                )
+        try:
+            page = 1
+            while True:
+                if page > MAX_PAGES:
+                    raise SourceUnavailable(
+                        f'resident index never said has_more=false after {MAX_PAGES} pages'
+                    )
 
-            code, body = self._get(f'/residents?page={page}&page_size={PAGE_SIZE}')
-            if code != 200:
-                raise SourceUnavailable(f'resident index returned {code}: {body}')
+                code, body = self._get(f'/residents?page={page}&page_size={PAGE_SIZE}')
+                if code != 200:
+                    raise SourceUnavailable(f'resident index returned {code}: {body}')
 
-            # A response in an unexpected shape is the source misbehaving,
-            # exactly like a 500 is - so it gets the same treatment, rather
-            # than a KeyError crashing the API.
-            if not isinstance(body, dict) or not isinstance(body.get('results'), list):
-                raise SourceUnavailable(f'resident index returned an unexpected shape on page {page}: {body!r}')
+                # A response in an unexpected shape is the source misbehaving,
+                # exactly like a 500 is - so it gets the same treatment, rather
+                # than a KeyError crashing the API.
+                if not isinstance(body, dict) or not isinstance(body.get('results'), list):
+                    raise SourceUnavailable(f'resident index returned an unexpected shape on page {page}: {body!r}')
 
-            for record in body['results']:
-                if not isinstance(record, dict) or 'id' not in record:
-                    raise SourceUnavailable(f'resident index returned a malformed record on page {page}: {record!r}')
-                # Keying on id is what removes the duplicates. A record that
-                # arrives on two pages simply overwrites itself here.
-                by_id[record['id']] = record
+                for record in body['results']:
+                    if not isinstance(record, dict) or 'id' not in record:
+                        raise SourceUnavailable(f'resident index returned a malformed record on page {page}: {record!r}')
+                    # Keying on id is what removes the duplicates. A record that
+                    # arrives on two pages simply overwrites itself here.
+                    by_id[record['id']] = record
 
-            if not body.get('has_more'):
-                break
-            page += 1
+                if not body.get('has_more'):
+                    break
+                page += 1
+        except SourceUnavailable:
+            self._last_partial = by_id or None
+            raise
 
         self._cache = by_id
         self._cached_at = time.monotonic()
+        self._last_partial = None
         return by_id
 
     def list_all_or_last_known(self):
-        """Fresh data if we can get it; the last data we got if we can't.
+        """Fresh data if we can get it; the last complete data we got if we
+        can't; whatever this walk collected before failing if that's all
+        there is.
 
-        Returns (records, seconds_old). seconds_old is None when the answer
-        is fresh, and the age of the saved copy when it isn't - so the
-        caller can always tell the two apart and say so in the response.
+        Returns (records, seconds_old, partial_reason). At most one of the
+        two trailing values is ever set - they are different, honest
+        caveats, not degrees of the same one:
+          - seconds_old: this is complete, but from a moment ago.
+          - partial_reason: this is current, but the walk broke before
+            finishing, so some residents may be missing rather than aged.
+        Neither set at all means fresh and complete.
 
-        "Partial data beats an error page": if the source is down but we
-        fetched it successfully a minute ago, that minute-old data is far
-        more use to a staff member than an error - as long as we say how
-        old it is. Past max_snapshot_age we stop vouching for it and fail
-        like normal, because at some point old data stops being useful and
-        starts being misleading.
+        "Partial data beats an error page" already covers a source that's
+        down but was fetched successfully a minute ago - that's the
+        seconds_old branch. This extends the same reasoning one step
+        further: a *first* walk that fails on, say, page 7 of 10 still has
+        pages 1-6 worth of real, current residents in hand. Discarding
+        those and reporting the whole population as unavailable would be
+        strictly less honest than saying what was actually collected, and
+        why it might be short. The stale-but-complete cache is still
+        preferred over this when both are available, because a fuller,
+        slightly older list beats a fresher, smaller one.
         """
         try:
-            return self.list_all(), None
-        except SourceUnavailable:
+            return self.list_all(), None, None
+        except SourceUnavailable as e:
             if self._cache is not None:
                 age = time.monotonic() - self._cached_at
                 if age < self.max_snapshot_age:
-                    return self._cache, age
+                    return self._cache, age, None
+            if self._last_partial:
+                reason = (
+                    f'the walk stopped early ({e}); returning the '
+                    f'{len(self._last_partial)} resident(s) collected before that'
+                )
+                return self._last_partial, None, reason
             raise

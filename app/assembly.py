@@ -135,7 +135,7 @@ STALE_NOTE = (
 )
 
 
-def _status(status, error=None, confidence=None, stale_seconds=None):
+def _status(status, error=None, confidence=None, stale_seconds=None, partial_detail=None):
     """Every source block in every response is built here, so they all have
     the same shape: what happened, and why in plain language."""
     payload = {'status': status, 'error': error}
@@ -146,6 +146,10 @@ def _status(status, error=None, confidence=None, stale_seconds=None):
         # Never show old data without saying it is old.
         payload['stale_seconds'] = round(stale_seconds, 1)
         payload['stale_detail'] = STALE_NOTE
+    if partial_detail is not None:
+        # Never show an incomplete listing without saying it is incomplete -
+        # same principle as stale_seconds above, for a different kind of gap.
+        payload['partial_detail'] = partial_detail
     return payload
 
 
@@ -163,9 +167,16 @@ def _benefits_index_or_error(benefits_client):
 
 
 def _resident_index_or_error(rest_client):
-    """Returns (index, error_message, seconds_old). Same shape as above."""
+    """Returns (index, error_message, seconds_old). Same shape as above.
+
+    A partial result (see list_all_or_last_known) is used as-is here: this
+    index only ever feeds the ambiguity check, which is already
+    conservative about a index it can't fully vouch for - a missing
+    resident just means one fewer thing to compare against, never a wrong
+    answer. The partial_reason itself isn't surfaced through this path.
+    """
     try:
-        records, age = rest_client.list_all_or_last_known()
+        records, age, _partial_reason = rest_client.list_all_or_last_known()
         return build_resident_key_index(records), None, age
     except SourceUnavailable as e:
         return None, str(e), None
@@ -197,10 +208,12 @@ def build_unified_resident(identifier, rest_client, benefits_client, attempt_mat
             unified['benefits_source'] = _status('unavailable', benefits_error)
             return unified
 
-        # None here means "we could not check the index side", which is
-        # different from "we checked and it was unique" - find_benefits_match
-        # skips the check rather than assuming it passed.
+        # We also need every resident, to check the name+DOB is unique on
+        # our side too. A None here means "we could not check that side",
+        # which is different from "we checked and it was unique" -
+        # find_benefits_match skips the check rather than assuming it passed.
         resident_keys, _, _ = _resident_index_or_error(rest_client)
+
         status, record, reason, confidence = find_benefits_match(
             resident, benefits_index, resident_keys
         )
@@ -230,6 +243,7 @@ def build_unified_resident(identifier, rest_client, benefits_client, attempt_mat
             return unified
 
         benefits_index, _, _ = _benefits_index_or_error(benefits_client)
+
         status, record, reason, confidence = find_resident_match(
             benefit, resident_keys, benefits_index
         )
@@ -260,7 +274,7 @@ def build_unified_resident(identifier, rest_client, benefits_client, attempt_mat
 
 def build_unified_all(rest_client, benefits_client, attempt_match=True):
     try:
-        residents, resident_age = rest_client.list_all_or_last_known()
+        residents, resident_age, resident_partial_reason = rest_client.list_all_or_last_known()
     except SourceUnavailable as e:
         # count stays null rather than 0: we did not look and find nothing,
         # we could not look at all, and 0 would assert the former.
@@ -305,7 +319,7 @@ def build_unified_all(rest_client, benefits_client, attempt_match=True):
         results.append(entry)
 
     return {
-        'resident_source': _status('ok', stale_seconds=resident_age),
+        'resident_source': _status('ok', stale_seconds=resident_age, partial_detail=resident_partial_reason),
         'benefits_source': benefits_source,
         'count': len(results),
         'residents': results,
