@@ -1,15 +1,16 @@
-"""Client for the Resident Index (REST, paginated).
+"""Client for the Resident Index (the REST source).
 
-The index is mostly reliable but its sort key can shift while a client is
-paging, which serves some records on two consecutive pages. list_all()
-collapses that by keying on id rather than trusting page boundaries.
+This file has one job: get residents out of the REST service, and hide
+everything odd about that service from the rest of the app.
 
-list_all() is cached on the same terms as the benefits register's: only
-successful walks are cached, and a failure is never served from stale data.
-The index isn't slow the way the register is, so this isn't a latency fix -
-it's here because a full page walk is now on the single-resident path (both
-the register-ref door and the reverse-ambiguity check need the whole
-population), and paying 25 page requests per lookup would be careless.
+The odd thing is that the index sometimes serves the same record on two
+consecutive pages, so walking the pages naively gives you duplicates.
+list_all() fixes that by storing records in a dictionary keyed on the
+resident id - the same record arriving twice just overwrites itself.
+
+Nothing outside this file knows this source is paginated, or that it has
+that quirk. That is the point: if the REST source changes on day two, this
+file changes and nothing else does.
 """
 import json
 import time
@@ -20,7 +21,7 @@ import urllib.request
 from app.errors import SourceUnavailable
 
 PAGE_SIZE = 25
-MAX_PAGES = 10_000  # generous cap against a source that never sets has_more=false
+MAX_PAGES = 10_000  # a source that never says has_more=false must not loop forever
 
 
 class ResidentIndexClient:
@@ -29,38 +30,48 @@ class ResidentIndexClient:
         self.timeout = timeout
         self.cache_ttl = cache_ttl
         self.max_snapshot_age = max_snapshot_age
-        self._list_all_cache = None  # (cached_at, {id: record})
+        # The cache is just the last successful list_all() result plus the
+        # time we fetched it. Nothing cleverer than that.
+        self._cache = None
+        self._cached_at = 0.0
 
-    def _get_json(self, path):
-        """Fetch and parse. A response we can't even parse as JSON is treated
-        the same as an unreachable source - we have no basis to trust its
-        status code either, so we don't try to special-case it."""
+    def _get(self, path):
+        """One HTTP GET. Returns (status_code, parsed_json).
+
+        A response we cannot parse as JSON is treated exactly like an
+        unreachable source: if we can't trust the body, we have no reason to
+        trust the status code either.
+        """
         url = f'{self.base_url}{path}'
         try:
             with urllib.request.urlopen(url, timeout=self.timeout) as resp:
                 code, raw = resp.getcode(), resp.read().decode('utf-8')
         except urllib.error.HTTPError as e:
+            # An error response (404, 500...) still has a body worth reading.
             with e:
-                raw = e.read().decode('utf-8')
-            code = e.code
+                code, raw = e.code, e.read().decode('utf-8')
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             raise SourceUnavailable(f'resident index unreachable: {e}') from e
 
         try:
             return code, json.loads(raw)
         except json.JSONDecodeError as e:
-            raise SourceUnavailable(f'resident index returned unparseable JSON (status {code}): {e}') from e
+            raise SourceUnavailable(
+                f'resident index returned something that is not JSON (status {code}): {e}'
+            ) from e
 
     def health(self):
+        """Is this source up? Used by GET /health, not by the data calls."""
         try:
-            code, _ = self._get_json('/health')
+            code, _ = self._get('/health')
             return code == 200
         except SourceUnavailable:
             return False
 
     def get_by_id(self, resident_id):
+        """One resident, or None if this source has never heard of them."""
         safe_id = urllib.parse.quote(resident_id, safe='')
-        code, body = self._get_json(f'/residents/{safe_id}')
+        code, body = self._get(f'/residents/{safe_id}')
         if code == 404:
             return None
         if code != 200:
@@ -70,40 +81,45 @@ class ResidentIndexClient:
         return body
 
     def list_all(self):
-        """Walk every page, deduping by id. Returns {id: record}.
+        """Every resident, as {id: record}.
 
-        Any page whose shape doesn't match what we expect (missing
-        'results', a record with no 'id', a non-dict entry) is treated as a
-        source failure rather than a KeyError - a shape violation is exactly
-        as much "the source misbehaving" as a 500 is. A source that never
-        sets has_more=false gets the same treatment once MAX_PAGES is hit -
-        an unbounded walk is a hang by another name, just one no per-call
-        timeout catches on its own.
+        Cached for cache_ttl seconds. Only successful walks are cached, so a
+        failure is never hidden behind old data.
         """
-        if self._list_all_cache is not None:
-            cached_at, data = self._list_all_cache
-            if time.monotonic() - cached_at < self.cache_ttl:
-                return data
+        if self._cache is not None and time.monotonic() - self._cached_at < self.cache_ttl:
+            return self._cache
 
         by_id = {}
         page = 1
         while True:
             if page > MAX_PAGES:
-                raise SourceUnavailable(f'resident index never signalled has_more=false after {MAX_PAGES} pages')
-            code, body = self._get_json(f'/residents?page={page}&page_size={PAGE_SIZE}')
+                raise SourceUnavailable(
+                    f'resident index never said has_more=false after {MAX_PAGES} pages'
+                )
+
+            code, body = self._get(f'/residents?page={page}&page_size={PAGE_SIZE}')
             if code != 200:
                 raise SourceUnavailable(f'resident index returned {code}: {body}')
+
+            # A response in an unexpected shape is the source misbehaving,
+            # exactly like a 500 is - so it gets the same treatment, rather
+            # than a KeyError crashing the API.
             if not isinstance(body, dict) or not isinstance(body.get('results'), list):
                 raise SourceUnavailable(f'resident index returned an unexpected shape on page {page}: {body!r}')
-            for r in body['results']:
-                if not isinstance(r, dict) or 'id' not in r:
-                    raise SourceUnavailable(f'resident index returned a malformed record on page {page}: {r!r}')
-                by_id[r['id']] = r
+
+            for record in body['results']:
+                if not isinstance(record, dict) or 'id' not in record:
+                    raise SourceUnavailable(f'resident index returned a malformed record on page {page}: {record!r}')
+                # Keying on id is what removes the duplicates. A record that
+                # arrives on two pages simply overwrites itself here.
+                by_id[record['id']] = record
+
             if not body.get('has_more'):
                 break
             page += 1
 
-        self._list_all_cache = (time.monotonic(), by_id)
+        self._cache = by_id
+        self._cached_at = time.monotonic()
         return by_id
 
     def list_all_or_last_known(self):
@@ -123,9 +139,8 @@ class ResidentIndexClient:
         try:
             return self.list_all(), None
         except SourceUnavailable:
-            if self._list_all_cache is not None:
-                cached_at, data = self._list_all_cache
-                age = time.monotonic() - cached_at
+            if self._cache is not None:
+                age = time.monotonic() - self._cached_at
                 if age < self.max_snapshot_age:
-                    return data, age
+                    return self._cache, age
             raise
