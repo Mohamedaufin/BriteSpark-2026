@@ -134,9 +134,14 @@ class BenefitsRegisterResilienceTests(unittest.TestCase):
 
     def test_flaky_source_eventually_succeeds_with_retries(self):
         client = BenefitsRegisterClient(
-            f'http://127.0.0.1:{XML_PORT_NORMAL}', max_retries=5, retry_base_delay=0.05,
+            f'http://127.0.0.1:{XML_PORT_NORMAL}', max_retries=10, retry_base_delay=0.05,
         )
-        # 0.15 failure rate ^ 5 retries is a ~0.008% chance of a false failure here.
+        # At the post-day-two 40% failure rate, 0.4^10 is a ~0.01% chance of
+        # a false failure here - the same margin the original 5 retries gave
+        # at 15% (0.15^5 was ~0.008%). This client's retry count is a test
+        # fixture tuned for suite reliability, not a claim about what a real
+        # caller should use - see DECISIONS.md's day-two entry for why the
+        # shipped default (3) was deliberately left alone.
         records = client.list_all()
         self.assertGreater(len(records), 0)
 
@@ -144,8 +149,13 @@ class BenefitsRegisterResilienceTests(unittest.TestCase):
 class UnifiedAssemblyTests(unittest.TestCase):
     def setUp(self):
         self.rest = ResidentIndexClient(f'http://127.0.0.1:{REST_PORT}')
+        # max_retries=10, not the shipped default of 3: this instance is
+        # reused across many tests in this class, and at the post-day-two
+        # 40% failure rate a handful of independent calls at the shipped
+        # default would carry a non-trivial cumulative chance of a spurious
+        # failure. 10 keeps a single call's false-failure chance at ~0.01%.
         self.healthy_benefits = BenefitsRegisterClient(
-            f'http://127.0.0.1:{XML_PORT_NORMAL}', max_retries=5, retry_base_delay=0.05,
+            f'http://127.0.0.1:{XML_PORT_NORMAL}', max_retries=10, retry_base_delay=0.05,
         )
         self.dead_benefits = BenefitsRegisterClient(
             f'http://127.0.0.1:{XML_PORT_DEAD}', max_retries=2, retry_base_delay=0.05,
