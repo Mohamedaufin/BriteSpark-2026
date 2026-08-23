@@ -1,10 +1,11 @@
-"""Client for the Benefits Register (legacy XML, slow and unreliable).
+"""Client for the Benefits Register (the legacy XML source).
 
-Roughly 4 in 10 calls returns a 500 as a matter of course (raised
-permanently from 1 in 7 on day two; see DECISIONS.md). A single 500 is not
-"the source is down" - it is Tuesday. We retry with backoff before surfacing
-SourceUnavailable, so a genuinely dead source still looks different from an
-ordinary flaky call.
+This source is slow (about 1.5 seconds a call) and fails often - 40% of
+calls as of day two (raised permanently from 15%; see DECISIONS.md). Both
+are normal for it, not faults to wait out, so this file deals with them
+itself and nothing outside it has to care. Nothing below names the actual
+number: it lives in the running service's configuration, not here, so a
+future change to it needs no code change.
 
 Three things happen here, in increasing order of "how bad is it":
 
@@ -15,12 +16,10 @@ Three things happen here, in increasing order of "how bad is it":
    it for breaker_cooldown seconds instead of making every request wait
    through the full retry budget to learn the same thing.
 3. Give up. Raise SourceUnavailable, which assembly.py turns into an
-   honest "benefits_source: unavailable" in the response - unless a recent
-   copy is still on hand, in which case list_all_or_last_known() serves
-   that instead, labelled with its age.
+   honest "benefits_source: unavailable" in the response.
 
-There is also a short-TTL cache on list_all(), because this source is slow
-and the same full dump is what every matched lookup needs.
+There is also a small cache, because this source is slow and the same full
+dump is what every matched lookup needs.
 """
 import random
 import time
